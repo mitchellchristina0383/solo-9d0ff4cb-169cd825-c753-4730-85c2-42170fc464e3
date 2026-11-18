@@ -18,6 +18,7 @@ PENDING = "PENDING"        # 已送达/投递中，尚未拿到回执
 ACKED = "ACKED"            # 已拿到原节点成功回执
 TIMEOUT_UNCERTAIN = "TIMEOUT_UNCERTAIN"  # 写入已落库但回执超时，结果不确定
 FAILED = "FAILED"          # 节点明确拒绝（连接前失败/5xx），未送达
+REJECTED_QUOTA = "REJECTED_QUOTA"  # 目标节点配额已满，明确未受理（未落库、不改投）
 
 # 单连接 + 单写锁，SQLite 写入串行化，避免 lock 竞争。
 _conn: aiosqlite.Connection | None = None

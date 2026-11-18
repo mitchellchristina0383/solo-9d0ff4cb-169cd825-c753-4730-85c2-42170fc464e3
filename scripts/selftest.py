@@ -9,7 +9,14 @@
   4. 连续两次切流都不打断各自的在途写入（再次切流安全）；
   5. 回执超时：返回 504 + TIMEOUT_UNCERTAIN，不自动补投；
      事后向"原送达节点"查询可确认其实已落库并回执；
-  6. 全量核对：两侧后端写入 ID 集合不相交，每条写入恰好出现一次。
+  6. 全量核对：两侧后端写入 ID 集合不相交，每条写入恰好出现一次；
+  7. 为节点设置持久化内容字节配额，状态页展示已用/剩余字节；
+  8. 并发占额与切流交错：恰好一份余量只被并发请求占用一次，
+     其余请求被后端原子拒绝（507），代理明确报告 REJECTED_QUOTA（未受理），
+     不改投其他节点、不误记为已回执；多字节内容按 UTF-8 字节数计费；
+  9. 节点健康但配额已满时切流被 409 拦截，旧路由保持；
+ 10. 调低配额保留旧记录，直写后端也被原子拒绝，配额持久化在 meta 表；
+ 11. 慢写入已送达后调低配额，回执仍由原节点返回；取消配额后恢复受理。
 
 用法:
   python3 -I scripts/selftest.py [--python /path/to/venv/python]
@@ -260,6 +267,138 @@ def main() -> int:
             con.close()
             check(n == len(ids_a if node == "A" else ids_b),
                   f"后端 {node} 的 SQLite 持久化写入数 = {n}")
+
+        print("\n== 场景 7：为 B 设置字节配额，状态页展示已用/剩余字节 ==")
+        _, rec_b = http("GET", f"{proxy}/api/nodes/B/records")
+        used_b = sum(len(r["payload"].encode("utf-8")) for r in rec_b["records"])
+        code, qs = http("POST", f"{proxy}/api/nodes/B/quota", {"bytes": used_b + 200})
+        check(code == 200 and qs.get("quota_bytes") == used_b + 200,
+              "通过代理为 B 设置字节配额",
+              f"quota={used_b + 200}B used={qs.get('used_bytes')}B")
+        _, s = http("GET", f"{proxy}/api/status")
+        qb = s["nodes"]["B"]["quota"]
+        check(qb["quota_bytes"] == used_b + 200 and qb["used_bytes"] == used_b
+              and qb["remaining_bytes"] == 200,
+              "状态页（网页数据源）显示 B 的已用/剩余字节",
+              f"used={qb['used_bytes']}B remaining={qb['remaining_bytes']}B")
+        code, _ = http("POST", f"{proxy}/api/nodes/B/quota", {"bytes": -1})
+        check(code == 400, "非法配额（负数）被 400 拒绝")
+
+        print("\n== 场景 8：切流到 B 后并发占额——同一份余量只被占用一次 ==")
+        code, sw = http("POST", f"{proxy}/api/switch", {"target": "B"})
+        check(code == 200 and sw["active"] == "B", "B 有余量时切流成功")
+        mb = "中文字符✓"  # 4 个 CJK + 1 个符号 = 15 个 UTF-8 字节
+        mb_bytes = len(mb.encode("utf-8"))
+        code, w_mb = http("POST", f"{proxy}/api/writes?delay=0", {"payload": mb})
+        _, s = http("GET", f"{proxy}/api/status")
+        qb = s["nodes"]["B"]["quota"]
+        check(code == 201 and qb["used_bytes"] == used_b + mb_bytes,
+              "多字节内容按 UTF-8 字节数计入已用",
+              f"{len(mb)} 字符 = {mb_bytes}B, used={qb['used_bytes']}B")
+        remaining = qb["remaining_bytes"]
+        racers = [SlowPost(proxy, 0, "X" * remaining) for _ in range(6)]
+        for t in racers:
+            t.start()
+        for t in racers:
+            t.join(timeout=15)
+        oks = [t for t in racers if t.result and t.result[0] == 201]
+        rejs = [t for t in racers if t.result and t.result[0] == 507]
+        check(len(oks) == 1 and len(rejs) == 5,
+              "6 个并发写入竞争恰好一份余量：1 个受理、5 个未受理",
+              f"201={len(oks)} 507={len(rejs)}")
+        check(all(t.result[1].get("status") == "REJECTED_QUOTA"
+                  and t.result[1].get("accepted") is False
+                  and not t.result[1].get("uncertain") for t in rejs),
+              "未受理响应明确标记 REJECTED_QUOTA 且 accepted=false")
+        _, s = http("GET", f"{proxy}/api/status")
+        qb = s["nodes"]["B"]["quota"]
+        check(qb["used_bytes"] == qb["quota_bytes"] and qb["remaining_bytes"] == 0,
+              "余量未被重复占用：已用恰好等于配额",
+              f"used={qb['used_bytes']}B quota={qb['quota_bytes']}B")
+        rej_ids = {t.result[1]["id"] for t in rejs}
+        st_map = {w["id"]: w["status"] for w in s["writes"]}
+        check(all(st_map.get(i) == "REJECTED_QUOTA" for i in rej_ids),
+              "代理记录中未受理写入为 REJECTED_QUOTA（未误记为已回执）")
+        _, rec_a2 = http("GET", f"{proxy}/api/nodes/A/records")
+        _, rec_b2 = http("GET", f"{proxy}/api/nodes/B/records")
+        ids_a2 = {r["id"] for r in rec_a2["records"]}
+        ids_b2 = {r["id"] for r in rec_b2["records"]}
+        check(not (rej_ids & (ids_a2 | ids_b2)), "未受理写入在两个后端都不存在")
+        check(len(ids_a2) == len(ids_a), "代理没有向 A 改投任何写入（A 记录数不变）")
+        check(len(ids_b2) == len(ids_b) + 2, "B 只多了多字节写入与竞额赢家共 2 条")
+
+        print("\n== 场景 9：B 健康但配额已满 -> 切流保持旧路由 ==")
+        code, sw = http("POST", f"{proxy}/api/switch", {"target": "A"})
+        check(code == 200 and sw["active"] == "A", "切回 A（A 不限额）")
+        _, s = http("GET", f"{proxy}/api/status")
+        check(s["nodes"]["B"]["healthy"] is True, "B 仍然健康（/healthz 200）")
+        code, blocked = http("POST", f"{proxy}/api/switch", {"target": "B"})
+        check(code == 409 and blocked.get("blocked") and blocked.get("active") == "A"
+              and "quota" in str(blocked.get("reason", "")),
+              "B 配额满时切流被 409 拦截，现役仍为 A",
+              str(blocked.get("reason", ""))[:80])
+        _, s = http("GET", f"{proxy}/api/status")
+        check(any(ev["kind"] == "SWITCH_BLOCKED" and "quota" in ev["message"]
+                  for ev in s["events"]),
+              "事件日志记录配额满导致的切流拦截")
+        code, w_stay = http("POST", f"{proxy}/api/writes?delay=0", {"payload": "stays-on-a"})
+        check(code == 201 and w_stay["node"] == "A", "拦截后新写入仍走旧路由 A")
+
+        print("\n== 场景 10：调低配额保留旧记录，直写后端也被原子拒绝 ==")
+        _, rec_b_before = http("GET", f"{proxy}/api/nodes/B/records")
+        n_b_before = len(rec_b_before["records"])
+        code, qs = http("POST", f"{proxy}/api/nodes/B/quota", {"bytes": 10})
+        check(code == 200 and qs["remaining_bytes"] < 0,
+              "配额调低到远低于已用，剩余为负",
+              f"remaining={qs.get('remaining_bytes')}B")
+        _, rec_b_after = http("GET", f"{proxy}/api/nodes/B/records")
+        check(len(rec_b_after["records"]) == n_b_before,
+              "调低配额后旧记录全部保留", f"records={n_b_before}")
+        code, direct = http("POST", f"http://127.0.0.1:{ports['B']}/writes",
+                            {"payload": "x"})
+        check(code == 507 and direct.get("error") == "quota_exceeded",
+              "直接写后端也被 507 拒绝（容量判断在后端原子完成）")
+        _, rec_b_after2 = http("GET", f"{proxy}/api/nodes/B/records")
+        check(len(rec_b_after2["records"]) == n_b_before, "被拒写入未落库")
+        con = sqlite3.connect(work / "b.db")
+        row = con.execute("SELECT value FROM meta WHERE key='quota_bytes'").fetchone()
+        con.close()
+        check(row is not None and int(row[0]) == 10,
+              "配额已持久化到后端 SQLite 的 meta 表")
+
+        print("\n== 场景 11：慢写入已送达后调低配额，回执仍由原节点返回 ==")
+        slow = SlowPost(proxy, 1.5, "slow-before-quota-cut")
+        slow.start()
+        deadline = time.time() + 5
+        slow_id = None
+        while time.time() < deadline:
+            _, s = http("GET", f"{proxy}/api/status")
+            for row_w in s["writes"]:
+                if row_w["status"] == "PENDING" and row_w["target_node"] == "A":
+                    slow_id = row_w["id"]
+                    break
+            if slow_id:
+                break
+            time.sleep(0.1)
+        check(bool(slow_id), "慢写入已送达 A 并落库（PENDING）")
+        code, qs = http("POST", f"{proxy}/api/nodes/A/quota", {"bytes": 0})
+        check(code == 200, "在途期间把 A 配额调为 0")
+        slow.join(timeout=10)
+        check(slow.result and slow.result[0] == 201 and slow.result[1]["node"] == "A",
+              "已送达的慢写入不受配额影响，仍由原节点 A 回执")
+        code, rej = http("POST", f"{proxy}/api/writes?delay=0",
+                         {"payload": "after-quota-zero"})
+        check(code == 507 and rej.get("status") == "REJECTED_QUOTA",
+              "配额为 0 后新写入未受理（REJECTED_QUOTA）")
+        _, rec_a3 = http("GET", f"{proxy}/api/nodes/A/records")
+        check(any(r["id"] == slow_id for r in rec_a3["records"]),
+              "调低配额后 A 的旧记录（含慢写入）仍保留")
+        code, qs = http("POST", f"{proxy}/api/nodes/A/quota", {"bytes": None})
+        check(code == 200 and qs.get("unlimited") is True, "取消 A 配额限制")
+        code, w_ok = http("POST", f"{proxy}/api/writes?delay=0",
+                          {"payload": "quota-cleared"})
+        check(code == 201 and w_ok["status"] == "ACKED", "取消限制后写入恢复受理")
+        http("POST", f"{proxy}/api/nodes/B/quota", {"bytes": None})
 
     finally:
         print("\n== 清理进程 ==")

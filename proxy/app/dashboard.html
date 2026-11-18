@@ -26,6 +26,7 @@
   .b-warn { background:rgba(241,185,68,.15); color:var(--warn); }
   .b-info { background:rgba(74,163,255,.15); color:var(--info); }
   .b-mut { background:rgba(138,151,173,.15); color:var(--mut); }
+  .b-quota { background:rgba(186,104,200,.18); color:#ce93d8; }
   button { border:1px solid var(--line); background:#223050; color:var(--txt);
            border-radius:7px; padding:7px 14px; cursor:pointer; font-size:13px; }
   button:hover { border-color:var(--info); }
@@ -63,7 +64,7 @@
 
 <main>
   <section class="card">
-    <h2>节点与切流（探测失败会保留旧路由；切流不打断在途写入，回执仍从原节点取）</h2>
+    <h2>节点与切流（探测失败或配额已满都会保留旧路由；切流不打断在途写入，回执仍从原节点取）</h2>
     <div class="grid2" id="nodes"></div>
   </section>
 
@@ -85,7 +86,9 @@
     </table></div>
     <p class="uncertain-note" style="margin-top:12px">
       ⚠️ <b>TIMEOUT_UNCERTAIN</b>：写入已在后端落库但回执超时，结果不确定。
-      系统<b>不会</b>自动向另一节点补投；可点"向原节点查询"核实（切流后仍查原送达节点）。
+      系统<b>不会</b>自动向另一节点补投；可点"向原节点查询"核实（切流后仍查原送达节点）。<br>
+      ⛔ <b>REJECTED_QUOTA</b>：目标节点配额已满，写入<b>明确未受理</b>（后端未落库）。
+      系统不会改投其他节点，也绝不会把它误记为已回执；调大配额或清理空间后可重新投递。
     </p>
   </section>
 
@@ -119,9 +122,18 @@ function fmt(ts){ return ts ? new Date(ts*1000).toLocaleTimeString('zh-CN',{hour
 function esc(s){ return String(s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function statusBadge(s){
   const map = {ACKED:['b-ok','已回执 ACKED'], PENDING:['b-warn','待回执 PENDING'],
-    TIMEOUT_UNCERTAIN:['b-bad','结果不确定 TIMEOUT'], FAILED:['b-bad','失败 FAILED']};
+    TIMEOUT_UNCERTAIN:['b-bad','结果不确定 TIMEOUT'], FAILED:['b-bad','失败 FAILED'],
+    REJECTED_QUOTA:['b-quota','未受理·配额满 REJECTED']};
   const [cls,label] = map[s] || ['b-mut',s];
   return `<span class="badge ${cls}">${label}</span>`;
+}
+function fmtBytes(n){
+  if(n === null || n === undefined) return '∞';
+  const sign = n < 0 ? '-' : '';
+  n = Math.abs(n);
+  if(n < 1024) return sign + n + ' B';
+  if(n < 1024*1024) return sign + (n/1024).toFixed(1) + ' KiB';
+  return sign + (n/1024/1024).toFixed(1) + ' MiB';
 }
 async function api(path, opts={}){
   const r = await fetch(path, {headers:{'Content-Type':'application/json'}, ...opts});
@@ -140,6 +152,21 @@ async function switchTo(target){
 async function setFault(name, on){
   await api(`/api/nodes/${name}/fault`, {method:'POST', body:JSON.stringify({on})});
   toast(`节点 ${name} 健康故障注入：${on?'开启':'解除'}`); await refresh();
+}
+async function setQuota(name){
+  const raw = ($('#quota-'+name).value || '').trim();
+  const bytes = raw === '' ? null : parseInt(raw, 10);
+  if(bytes !== null && (!Number.isFinite(bytes) || bytes < 0)){
+    toast('配额需为 >= 0 的整数，留空表示不限制', false); return;
+  }
+  try{
+    const r = await api(`/api/nodes/${name}/quota`,
+      {method:'POST', body:JSON.stringify({bytes})});
+    toast(bytes === null
+      ? `节点 ${name} 配额已取消（不限制）`
+      : `节点 ${name} 配额已设为 ${fmtBytes(bytes)}，当前已用 ${fmtBytes(r.used_bytes)}`);
+    await refresh();
+  }catch(e){ toast('设置配额失败：'+e.message, false); }
 }
 async function loadRecords(name){
   try{ $('#rec'+name).textContent = '加载中…';
@@ -165,7 +192,9 @@ $('#send').onclick = async () => {
     toast(`写入 ${r.id} 已由节点 ${r.node} 回执（耗时 ${((Date.now()-t0)/1000).toFixed(1)}s）`);
   }catch(e){
     const d = e.data || {};
-    if(d.uncertain) toast(`⚠️ 回执超时，结果不确定（${((Date.now()-t0)/1000).toFixed(1)}s），未补投`, false);
+    if(d.status === 'REJECTED_QUOTA')
+      toast(`⛔ 节点 ${d.node||''} 配额已满，写入未受理（未改投其他节点、未记回执）`, false);
+    else if(d.uncertain) toast(`⚠️ 回执超时，结果不确定（${((Date.now()-t0)/1000).toFixed(1)}s），未补投`, false);
     else toast('写入失败：'+e.message, false);
   }finally{ btn.disabled=false; btn.textContent='投递写入'; await refresh(); }
 };
@@ -178,19 +207,30 @@ async function refresh(){
   $('#nodes').innerHTML = Object.entries(s.nodes).map(([name, h]) => {
     const d = s.drainage[name] || {};
     const isActive = name === s.active;
+    const q = h.quota || null;
+    const quotaFull = q && q.remaining_bytes !== null && q.remaining_bytes <= 0;
+    const quotaLine = !q ? '<span class="muted">配额信息不可用</span>'
+      : q.unlimited ? `已用 <b>${fmtBytes(q.used_bytes)}</b> / 上限 <b>∞（不限制）</b> / 剩余 <b>∞</b>`
+      : `已用 <b>${fmtBytes(q.used_bytes)}</b> / 上限 <b>${fmtBytes(q.quota_bytes)}</b> / 剩余 <b style="color:${quotaFull?'var(--bad)':'var(--ok)'}">${fmtBytes(q.remaining_bytes)}</b>`;
     return `<div class="card node" style="padding:14px">
       <div class="row"><b style="font-size:16px">节点 ${esc(name)}</b>
         <span class="badge ${h.healthy?'b-ok':'b-bad'}">${h.healthy?'健康':'故障/不可达'}</span>
         ${isActive?'<span class="badge b-info">现役 ACTIVE</span>':'<span class="badge b-mut">备用 STANDBY</span>'}
         ${d.draining?'<span class="badge b-warn">排空中 DRAINING</span>':''}
+        ${quotaFull?'<span class="badge b-quota">配额已满 QUOTA FULL</span>':''}
       </div>
       <div class="muted mono" style="font-size:12px">${esc(h.base_url)}</div>
       <div class="muted" style="font-size:12px">探测：${esc(h.detail)}</div>
       <div class="kv">
+        <b>存储配额</b><span>${quotaLine}</span>
         <b>在途(未回执)</b><span>${d.inflight_now??0} 个 ${(d.inflight_ids||[]).length?('<code>'+d.inflight_ids.map(esc).join(', ')+'</code>'):''}</span>
         <b>写入总数</b><span>${d.total??0}</span>
-        <b>已回执 / 待回执 / 不确定 / 失败</b>
-        <span>${d.acked??0} / ${d.pending??0} / ${d.timeout_uncertain??0} / ${d.failed??0}</span>
+        <b>已回执 / 待回执 / 不确定 / 失败 / 未受理</b>
+        <span>${d.acked??0} / ${d.pending??0} / ${d.timeout_uncertain??0} / ${d.failed??0} / ${d.rejected_quota??0}</span>
+      </div>
+      <div class="row">
+        <label class="muted" style="font-size:12px">字节配额 <input type="number" id="quota-${esc(name)}" min="0" step="1" placeholder="留空=不限制" style="width:130px"></label>
+        <button onclick="setQuota('${esc(name)}')">设置配额</button>
       </div>
       <div class="row">
         <button class="primary" ${isActive?'disabled':''} onclick="switchTo('${esc(name)}')">切换流量到 ${esc(name)}</button>

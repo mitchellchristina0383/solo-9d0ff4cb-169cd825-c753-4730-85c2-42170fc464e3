@@ -5,9 +5,13 @@
      之后无论怎么切流，这个请求只与该节点通信，绝不重投到另一节点。
   2. 切流只改 route 表，对已经发往旧节点、尚未回执的在途请求不做任何取消动作；
      回执仍从旧节点读取（也可事后用 /api/writes/{id}/refresh 向原节点查询）。
-  3. 切流前先探测目标节点 /healthz，探测失败则保留旧路由并返回 409。
+  3. 切流前先探测目标节点 /healthz（含配额余量），探测失败或配额已满都保留旧路由
+     并返回 409——节点健康但配额满同样不可切。
   4. 读超时（写入大概率已在后端落库，只是回执没回来）标记为 TIMEOUT_UNCERTAIN，
      返回 504 并在页面提示"结果不确定"，代理不做任何自动补投/重试。
+  5. 探测通过、实际投递前容量耗尽时，后端原子拒绝（507）：代理把该写入标记为
+     REJECTED_QUOTA（明确未受理），返回 507 告知页面，不改投其他节点、
+     也绝不误记为已回执。
 """
 from __future__ import annotations
 
@@ -65,26 +69,32 @@ app = FastAPI(title="write-cutover-proxy", lifespan=lifespan)
 
 # ---------------------------------------------------------------- 健康探测
 
-async def probe_node(base_url: str) -> tuple[bool, str]:
-    """返回 (是否健康, 说明)。探测本身绝不触发任何写入。"""
+async def probe_node(base_url: str) -> tuple[bool, str, dict[str, Any] | None]:
+    """返回 (是否健康, 说明, 配额信息|None)。探测本身绝不触发任何写入。"""
     client: httpx.AsyncClient = app.state.http
     try:
         resp = await client.get(
             f"{base_url}/healthz", timeout=httpx.Timeout(PROBE_TIMEOUT)
         )
     except httpx.RequestError as exc:
-        return False, f"probe request failed: {type(exc).__name__}: {exc}"
+        return False, f"probe request failed: {type(exc).__name__}: {exc}", None
+    quota = None
+    try:
+        quota = resp.json().get("quota")
+    except Exception:
+        quota = None
     if resp.status_code == 200:
-        return True, "healthy"
-    return False, f"healthz returned HTTP {resp.status_code}: {resp.text[:200]}"
+        return True, "healthy", quota
+    return False, f"healthz returned HTTP {resp.status_code}: {resp.text[:200]}", quota
 
 
-async def node_health_map() -> dict[str, dict[str, str]]:
+async def node_health_map() -> dict[str, dict[str, Any]]:
     nodes = await db.list_nodes()
     results = await asyncio.gather(*(probe_node(n["base_url"]) for n in nodes))
     return {
-        n["name"]: {"healthy": ok, "detail": detail, "base_url": n["base_url"]}
-        for n, (ok, detail) in zip(nodes, results)
+        n["name"]: {"healthy": ok, "detail": detail, "base_url": n["base_url"],
+                    "quota": quota}
+        for n, (ok, detail, quota) in zip(nodes, results)
     }
 
 
@@ -107,7 +117,7 @@ async def switch(request: Request) -> JSONResponse:
         return JSONResponse(content={"ok": True, "noop": True, "active": active,
                                      "message": "target is already active"})
 
-    healthy, detail = await probe_node(nodes[target])
+    healthy, detail, quota = await probe_node(nodes[target])
     if not healthy:
         # 探测失败：保持旧路由，不动 route 表。
         await db.add_event(
@@ -119,6 +129,20 @@ async def switch(request: Request) -> JSONResponse:
             content={"ok": False, "active": active, "blocked": True,
                      "reason": f"target {target} probe failed: {detail}",
                      "message": "kept old route"},
+        )
+
+    # 节点健康但配额已满（余量 <= 0）：同样保持旧路由。
+    remaining = quota.get("remaining_bytes") if quota else None
+    if remaining is not None and remaining <= 0:
+        reason = (f"target {target} quota full: used={quota.get('used_bytes')}B "
+                  f"quota={quota.get('quota_bytes')}B remaining={remaining}B")
+        await db.add_event("SWITCH_BLOCKED",
+                           f"{active} -> {target} blocked, {reason}")
+        return JSONResponse(
+            status_code=409,
+            content={"ok": False, "active": active, "blocked": True,
+                     "reason": reason, "quota": quota,
+                     "message": "kept old route: target has no remaining quota"},
         )
 
     async with _inflight_lock:
@@ -218,6 +242,27 @@ async def proxy_write(request: Request) -> JSONResponse:
                             content={"id": write_id, "node": active,
                                      "status": db.ACKED, "backend": ack})
 
+    if resp.status_code == 507:
+        # 探测后、实际投递前容量耗尽：后端原子拒绝，写入未受理。
+        # 明确标记 REJECTED_QUOTA，不改投其他节点，也绝不记为已回执。
+        try:
+            rej = resp.json()
+        except Exception:
+            rej = {}
+        detail = (f"{active} 配额已满，写入未受理 (507): "
+                  f"used={rej.get('used_bytes')}B quota={rej.get('quota_bytes')}B "
+                  f"needed={rej.get('needed_bytes')}B; 未改投其他节点")
+        await db.update_write_status(write_id, db.REJECTED_QUOTA, detail)
+        await db.add_event("WRITE_REJECTED_QUOTA", f"{write_id} -> {active}: {detail}")
+        return JSONResponse(
+            status_code=507,
+            content={"id": write_id, "node": active, "status": db.REJECTED_QUOTA,
+                     "accepted": False, "uncertain": False,
+                     "backend": rej,
+                     "detail": "target node quota full, write NOT accepted; "
+                               "no re-delivery to another node"},
+        )
+
     # 后端明确拒绝（如故障态 500）：未受理，FAILED；同样不补投。
     detail = f"{active} rejected with HTTP {resp.status_code}: {resp.text[:300]}"
     await db.update_write_status(write_id, db.FAILED, detail)
@@ -288,13 +333,15 @@ async def status() -> JSONResponse:
     for w in writes:
         slot = per_node.setdefault(
             w["target_node"], {"total": 0, "pending": 0, "acked": 0,
-                               "timeout_uncertain": 0, "failed": 0}
+                               "timeout_uncertain": 0, "failed": 0,
+                               "rejected_quota": 0}
         )
         slot["total"] += 1
         slot[w["status"].lower()] = slot.get(w["status"].lower(), 0) + 1
     for name in health:
         per_node.setdefault(name, {"total": 0, "pending": 0, "acked": 0,
-                                   "timeout_uncertain": 0, "failed": 0})
+                                   "timeout_uncertain": 0, "failed": 0,
+                                   "rejected_quota": 0})
     for name, slot in per_node.items():
         slot["inflight_now"] = inflight_counts.get(name, 0)
         slot["inflight_ids"] = inflight_ids.get(name, [])
@@ -329,6 +376,37 @@ async def node_records(name: str) -> JSONResponse:
         return JSONResponse(status_code=502,
                             content={"error": f"node {name} unreachable: {exc}"})
     return JSONResponse(content=resp.json())
+
+
+@app.post("/api/nodes/{name}/quota")
+async def node_quota(name: str, request: Request) -> JSONResponse:
+    """设置/清除某后端持久化内容的字节配额（透传后端控制接口）。
+
+    body: {"bytes": N} 设配额，{"bytes": null} 取消限制。配额由后端持久化，
+    调低只影响后续写入，已落库旧记录保留。
+    """
+    base_url = await db.node_url(name)
+    if base_url is None:
+        return JSONResponse(status_code=404, content={"error": f"unknown node {name}"})
+    body = await request.json()
+    try:
+        resp = await app.state.http.post(
+            f"{base_url}/control/quota", json={"bytes": body.get("bytes", None)},
+            timeout=httpx.Timeout(PROBE_TIMEOUT),
+        )
+    except httpx.RequestError as exc:
+        return JSONResponse(status_code=502,
+                            content={"error": f"node {name} unreachable: {exc}"})
+    if resp.status_code != 200:
+        return JSONResponse(status_code=resp.status_code, content=resp.json())
+    state = resp.json()
+    quota = state.get("quota_bytes")
+    await db.add_event(
+        "QUOTA_SET",
+        f"node {name} quota -> {'unlimited' if quota is None else str(quota) + 'B'} "
+        f"(used={state.get('used_bytes')}B remaining={state.get('remaining_bytes')}B)",
+    )
+    return JSONResponse(content=state)
 
 
 @app.post("/api/nodes/{name}/fault")
